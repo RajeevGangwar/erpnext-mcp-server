@@ -139,6 +139,30 @@ class ERPNextClient {
     }
   }
 
+  // Call a server-side API method
+  async callMethod(method: string, args?: Record<string, any>, httpMethod: "GET" | "POST" = "POST"): Promise<any> {
+    try {
+      let response;
+      if (httpMethod === "GET") {
+        response = await this.axiosInstance.get(`/api/method/${method}`, { params: args });
+      } else {
+        response = await this.axiosInstance.post(`/api/method/${method}`, args);
+      }
+      return response.data.message;
+    } catch (error: any) {
+      throw new Error(`Failed to call method ${method}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
+  // Delete a document
+  async deleteDocument(doctype: string, name: string): Promise<void> {
+    try {
+      await this.axiosInstance.delete(`/api/resource/${doctype}/${name}`);
+    } catch (error: any) {
+      throw new Error(`Failed to delete ${doctype} ${name}: ${error?.message || 'Unknown error'}`);
+    }
+  }
+
   // Get all available DocTypes
   async getAllDocTypes(): Promise<string[]> {
     try {
@@ -388,6 +412,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "object",
               additionalProperties: true,
               description: "Document data"
+            },
+            verbose: {
+              type: "boolean",
+              description: "If true, return the full document in the response. Default is false (returns minimal confirmation only)."
             }
           },
           required: ["doctype", "data"]
@@ -411,6 +439,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "object",
               additionalProperties: true,
               description: "Document data to update"
+            },
+            verbose: {
+              type: "boolean",
+              description: "If true, return the full document in the response. Default is false (returns minimal confirmation only)."
             }
           },
           required: ["doctype", "name", "data"]
@@ -433,6 +465,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             }
           },
           required: ["report_name"]
+        }
+      },
+      {
+        name: "get_document",
+        description: "Get a single document by DocType and name, including all child tables and linked data",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType (e.g., Customer, Sales Order, BOM)"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
+        name: "call_method",
+        description: "Call an ERPNext/Frappe whitelisted server-side API method. Can invoke any whitelisted method — use with caution. Args are passed as JSON body (POST) or query params (GET).",
+        inputSchema: {
+          type: "object",
+          properties: {
+            method: {
+              type: "string",
+              description: "Dotted method path (e.g., frappe.client.get_count, erpnext.manufacturing.doctype.work_order.work_order.make_stock_entry)"
+            },
+            args: {
+              type: "object",
+              additionalProperties: true,
+              description: "Method arguments as key-value pairs (optional)"
+            },
+            http_method: {
+              type: "string",
+              enum: ["GET", "POST"],
+              description: "HTTP method to use (default: POST). Use GET for read-only methods."
+            }
+          },
+          required: ["method"]
+        }
+      },
+      {
+        name: "submit_document",
+        description: "Submit a document (set docstatus to 1). Only works on submittable doctypes. Submitted documents can only be cancelled, not reverted to draft.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType (e.g., Sales Invoice, Journal Entry)"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            },
+            verbose: {
+              type: "boolean",
+              description: "If true, return the full document in the response. Default is false (returns minimal confirmation only)."
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
+        name: "cancel_document",
+        description: "Cancel a submitted document (set docstatus to 2). Cancelled documents cannot be modified — use amend workflow to create a corrected copy.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            },
+            verbose: {
+              type: "boolean",
+              description: "If true, return the full document in the response. Default is false (returns minimal confirmation only)."
+            }
+          },
+          required: ["doctype", "name"]
+        }
+      },
+      {
+        name: "delete_document",
+        description: "Permanently delete a document from ERPNext. This action cannot be undone. Submitted documents must be cancelled before deletion.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            doctype: {
+              type: "string",
+              description: "ERPNext DocType"
+            },
+            name: {
+              type: "string",
+              description: "Document name/ID"
+            }
+          },
+          required: ["doctype", "name"]
         }
       }
     ]
@@ -499,6 +635,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       const doctype = String(request.params.arguments?.doctype);
       const data = request.params.arguments?.data as Record<string, any> | undefined;
+      const verbose = request.params.arguments?.verbose === true;
       
       if (!doctype || !data) {
         throw new McpError(
@@ -509,11 +646,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       try {
         const result = await erpnext.createDocument(doctype, data);
+        if (verbose) {
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+          };
+        }
         return {
-          content: [{
-            type: "text",
-            text: `Created ${doctype}: ${result.name}\n\n${JSON.stringify(result, null, 2)}`
-          }]
+          content: [{ type: "text", text: JSON.stringify({
+            status: "success",
+            doctype: doctype,
+            name: result.name,
+            docstatus: result.docstatus
+          }) }]
         };
       } catch (error: any) {
         return {
@@ -540,6 +684,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const doctype = String(request.params.arguments?.doctype);
       const name = String(request.params.arguments?.name);
       const data = request.params.arguments?.data as Record<string, any> | undefined;
+      const verbose = request.params.arguments?.verbose === true;
       
       if (!doctype || !name || !data) {
         throw new McpError(
@@ -550,11 +695,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       
       try {
         const result = await erpnext.updateDocument(doctype, name, data);
+        if (verbose) {
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+          };
+        }
         return {
-          content: [{
-            type: "text",
-            text: `Updated ${doctype} ${name}\n\n${JSON.stringify(result, null, 2)}`
-          }]
+          content: [{ type: "text", text: JSON.stringify({
+            status: "success",
+            doctype: doctype,
+            name: result.name,
+            docstatus: result.docstatus
+          }) }]
         };
       } catch (error: any) {
         return {
@@ -601,6 +753,225 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{
             type: "text",
             text: `Failed to run report ${reportName}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+    
+    case "get_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+      
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+      
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+      
+      try {
+        const document = await erpnext.getDocument(doctype, name);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(document, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to get ${doctype} ${name}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+    
+    case "call_method": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+      
+      const method = String(request.params.arguments?.method);
+      const args = request.params.arguments?.args as Record<string, any> | undefined;
+      const httpMethod = (request.params.arguments?.http_method as "GET" | "POST") || "POST";
+      
+      if (!method) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Method is required"
+        );
+      }
+      
+      try {
+        const result = await erpnext.callMethod(method, args, httpMethod);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2)
+          }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to call method ${method}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+    
+    case "submit_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+      
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+      const verbose = request.params.arguments?.verbose === true;
+      
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+      
+      try {
+        const result = await erpnext.callMethod('frappe.client.submit', { doc: { doctype, name } });
+        if (verbose) {
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            status: "success",
+            doctype: doctype,
+            name: result.name,
+            docstatus: result.docstatus
+          }) }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to submit ${doctype} ${name}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+    
+    case "cancel_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+      
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+      const verbose = request.params.arguments?.verbose === true;
+      
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+      
+      try {
+        const result = await erpnext.callMethod('frappe.client.cancel', { doctype, name });
+        if (verbose) {
+          return {
+            content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+          };
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            status: "success",
+            doctype: doctype,
+            name: result.name,
+            docstatus: result.docstatus
+          }) }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to cancel ${doctype} ${name}: ${error?.message || 'Unknown error'}`
+          }],
+          isError: true
+        };
+      }
+    }
+    
+    case "delete_document": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{
+            type: "text",
+            text: "Not authenticated with ERPNext. Please configure API key authentication."
+          }],
+          isError: true
+        };
+      }
+      
+      const doctype = String(request.params.arguments?.doctype);
+      const name = String(request.params.arguments?.name);
+      
+      if (!doctype || !name) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "Doctype and name are required"
+        );
+      }
+      
+      try {
+        await erpnext.deleteDocument(doctype, name);
+        return {
+          content: [{ type: "text", text: JSON.stringify({
+            status: "success",
+            action: "deleted",
+            doctype: doctype,
+            name: name
+          }) }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to delete ${doctype} ${name}: ${error?.message || 'Unknown error'}`
           }],
           isError: true
         };
