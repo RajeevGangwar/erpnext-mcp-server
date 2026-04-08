@@ -212,13 +212,19 @@ function getCosmosContainer() {
 let sessionClient: ERPNextClient | null = null;
 let sessionCompany: string | null = null;  // company name for auto-filtering
 
-// Initialize default ERPNext client (from env vars)
-const erpnext = new ERPNextClient();
+// Initialize default ERPNext client (from env vars, optional)
+let erpnext: ERPNextClient | null = null;
+try {
+  erpnext = new ERPNextClient();
+} catch {
+  // No env vars set — that's OK, use connect() tool instead
+}
 
 // Get the active ERPNext client (session or default env-var client)
 function getClient(): ERPNextClient {
   if (sessionClient) return sessionClient;
-  return erpnext;  // fall back to env-var initialized client
+  if (erpnext) return erpnext;
+  throw new Error("Not connected. Call the 'connect' tool with a company_id first, or set ERPNEXT_URL env var.");
 }
 
 // Create an MCP server with capabilities for resources and tools
