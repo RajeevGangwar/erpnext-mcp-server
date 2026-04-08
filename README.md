@@ -1,54 +1,88 @@
 # ERPNext MCP Server
 
-MCP server for ERPNext/Frappe -- multi-site, header-based auth. Connects AI assistants to any ERPNext instance via the [Model Context Protocol](https://modelcontextprotocol.io). Supports **stdio** (Claude Desktop), **StreamableHTTP**, and **legacy SSE** transports.
+Connect AI assistants to your ERPNext instance. This server lets tools like Claude, Cursor, or any [MCP-compatible](https://modelcontextprotocol.io) client read and write ERPNext data through natural language.
 
-## Credential Modes
+## What Can It Do?
 
-| Mode | How credentials arrive | Use case |
-|---|---|---|
-| **HTTP headers** | `x-erpnext-url`, `x-erpnext-api-key`, `x-erpnext-api-secret`, `x-erpnext-company` | Periscope / remote deployment, multi-site |
-| **Environment variables** | `ERPNEXT_URL`, `ERPNEXT_API_KEY`, `ERPNEXT_API_SECRET`, `ERPNEXT_COMPANY` | stdio / Claude Desktop, single-site |
+Once connected, your AI assistant can:
 
-HTTP headers take precedence. If no headers are provided, env vars are used as fallback.
+- **Query your data** — "Show me all pending Sales Orders" / "What's the stock level of TV-55-OLED?"
+- **Create documents** — "Create a Purchase Order for 100 units of OLED panels from ShenTech"
+- **Run reports** — "Run the Gross Profit report for last month"
+- **Explore your schema** — "What fields does a Sales Order have?"
+- **Work with multiple companies** — "Switch to the PharmaCore company and show me their suppliers"
 
-One container can serve unlimited ERPNext sites -- each session gets credentials from its own request headers.
+## Quick Start
 
-## Security Notes
+### Option 1: Use with Claude Desktop (recommended for getting started)
 
-- The Docker image runs as a non-root user (`app`).
-- Set `MCP_SERVER_API_KEY` to protect the HTTP endpoint; requests must include a matching `x-api-key` header.
-- Credentials are scoped per session -- they are never shared across connections.
-- The SSE transport supports only one concurrent connection; use StreamableHTTP (`/mcp`) for production multi-session use.
+**Prerequisites:** [Node.js 20+](https://nodejs.org/) installed.
 
-## Tools (10)
+**Step 1:** Clone and build the server
 
-| Tool | Description |
-|---|---|
-| `list_companies` | List all companies on the connected ERPNext site |
-| `set_company` | Switch active company context (validates company exists, auto-filters transactions) |
-| `get_doctypes` | List all available DocTypes |
-| `get_doctype_fields` | Get the schema (field definitions) for a DocType via the meta API |
-| `get_document` | Fetch a single document by DocType and name |
-| `get_documents` | Query documents with filters, field selection, limits |
-| `create_document` | Create a new document |
-| `update_document` | Update an existing document |
-| `run_report` | Run an ERPNext report |
-| `call_method` | Call a whitelisted Frappe/ERPNext server method |
+```bash
+git clone https://github.com/RajeevGangwar/erpnext-mcp-server.git
+cd erpnext-mcp-server
+npm install
+npm run build
+```
 
-### Auto-filtering
+**Step 2:** Get your ERPNext API credentials
 
-When a company is active (via `set_company` or `x-erpnext-company` header), `get_documents` automatically adds a `company` filter for transaction doctypes (Sales Order, Purchase Order, Work Order, BOM, etc.). Master data doctypes (Item, Supplier, Customer) are not filtered since they are shared across companies.
+1. Log in to your ERPNext instance as Administrator
+2. Go to the search bar and type **User**, then open the User list
+3. Open the user you want to connect as (or create a dedicated API user)
+4. Scroll down to the **API Access** section (under the Settings tab)
+5. Click **Generate Keys**
+6. **Copy the API Secret immediately** — it is shown only once
+7. The API Key stays visible on the user page — copy it too
 
-Similarly, `create_document` auto-sets the `company` field for transaction doctypes only -- it will not add a company field to master data documents.
+> **Tip:** Create a dedicated user like `api@yourcompany.com` with only the roles you need (e.g., Sales User, Stock User) instead of using Administrator.
 
-## Resources
+**Step 3:** Configure Claude Desktop
 
-- `erpnext://DocTypes` -- list all available DocTypes
-- `erpnext://{doctype}/{name}` -- fetch a specific document
+Open your Claude Desktop config file:
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 
-## Periscope Integration
+Add this block (replace the placeholder values with your credentials):
 
-Configure an **Authentication JSON** block on the MCP connection in Periscope:
+```json
+{
+  "mcpServers": {
+    "erpnext": {
+      "command": "node",
+      "args": ["C:/path/to/erpnext-mcp-server/build/index.js"],
+      "env": {
+        "ERPNEXT_URL": "https://your-site.frappe.cloud",
+        "ERPNEXT_API_KEY": "your-api-key-from-step-2",
+        "ERPNEXT_API_SECRET": "your-api-secret-from-step-2"
+      }
+    }
+  }
+}
+```
+
+**Step 4:** Restart Claude Desktop and start chatting with your ERP data.
+
+### Option 2: Deploy as a shared HTTP server
+
+For teams or production use, deploy the server once and connect multiple clients to it. Credentials are passed per-session via HTTP headers — the server itself stores nothing.
+
+```bash
+# Build and run
+npm run build
+TRANSPORT=http PORT=8000 node build/index.js
+```
+
+Or with Docker:
+
+```bash
+docker build -t erpnext-mcp-server .
+docker run -p 8000:8000 -e TRANSPORT=http erpnext-mcp-server
+```
+
+Clients connect by passing ERPNext credentials as HTTP headers:
 
 ```json
 {
@@ -59,69 +93,125 @@ Configure an **Authentication JSON** block on the MCP connection in Periscope:
 }
 ```
 
-Periscope injects these as HTTP headers on every request to the MCP server.
+One server can serve multiple ERPNext sites simultaneously — each connection uses its own credentials.
 
-## Claude Desktop Integration
+---
 
-Add to your Claude Desktop config (`%APPDATA%/Claude/claude_desktop_config.json` on Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
+## Available Tools
 
-```json
-{
-  "mcpServers": {
-    "erpnext": {
-      "command": "node",
-      "args": ["/path/to/erpnext-mcp-server/build/index.js"],
-      "env": {
-        "ERPNEXT_URL": "https://your-site.frappe.cloud",
-        "ERPNEXT_API_KEY": "your-api-key",
-        "ERPNEXT_API_SECRET": "your-api-secret",
-        "ERPNEXT_COMPANY": "Your Company Name"
-      }
-    }
-  }
-}
-```
+| Tool | What it does | Example prompt |
+|------|-------------|----------------|
+| `list_companies` | Lists all companies on the ERPNext site | "What companies are set up?" |
+| `set_company` | Switches which company's data you're working with | "Switch to the Mumbai office company" |
+| `get_doctypes` | Lists all available document types | "What types of documents can I access?" |
+| `get_doctype_fields` | Shows the fields/schema for a document type | "What fields does a Purchase Order have?" |
+| `get_document` | Fetches a specific document by name | "Show me Sales Order SO-00042" |
+| `get_documents` | Searches documents with filters | "List all overdue Purchase Orders" |
+| `create_document` | Creates a new document | "Create a new Supplier called AcmeCorp" |
+| `update_document` | Updates an existing document | "Update Item TV-55-OLED description" |
+| `run_report` | Runs a built-in ERPNext report | "Run the Stock Balance report" |
+| `call_method` | Calls a server-side ERPNext method | "Get the BOM tree for TV-55-OLED" |
 
-## Environment Variables
+### Multi-Company Support
 
-| Variable | Required | Description |
-|---|---|---|
-| `ERPNEXT_URL` | For stdio | Base URL of your ERPNext instance |
-| `ERPNEXT_API_KEY` | For stdio | ERPNext API key |
-| `ERPNEXT_API_SECRET` | For stdio | ERPNext API secret |
-| `ERPNEXT_COMPANY` | No | Default company for auto-filtering |
-| `TRANSPORT` | No | `stdio` (default), `http`, or `sse` |
-| `PORT` | No | HTTP port (default: `8000`) |
-| `MCP_SERVER_API_KEY` | No | API key to protect the HTTP endpoint |
+ERPNext sites can host multiple companies. When you set an active company (via `set_company` or the `x-erpnext-company` header), the server automatically:
+
+- **Filters queries** — Sales Orders, Purchase Orders, Work Orders, and other transaction documents are scoped to that company
+- **Sets the company on new documents** — documents you create are assigned to the active company
+- **Leaves shared data alone** — Items, Suppliers, and Customers are shared across companies and are never filtered
+
+---
+
+## How Credentials Work
+
+The server supports two ways to receive ERPNext credentials:
+
+### For local/desktop use (environment variables)
+
+Set these when starting the server or in your Claude Desktop config:
+
+| Variable | Required | What it is |
+|----------|----------|------------|
+| `ERPNEXT_URL` | Yes | Your ERPNext site URL (e.g., `https://mycompany.frappe.cloud`) |
+| `ERPNEXT_API_KEY` | Yes | API key from ERPNext User > API Access |
+| `ERPNEXT_API_SECRET` | Yes | API secret (shown once when generated) |
+| `ERPNEXT_COMPANY` | No | Default company to use for filtering |
+
+### For shared/remote use (HTTP headers)
+
+When deployed as an HTTP server, each client passes credentials as request headers. This means:
+- The server stores no credentials — it's fully stateless
+- Different clients can connect to different ERPNext sites simultaneously
+- Credentials rotate without redeploying the server
+
+| Header | Maps to |
+|--------|---------|
+| `x-erpnext-url` | ERPNext site URL |
+| `x-erpnext-api-key` | API key |
+| `x-erpnext-api-secret` | API secret |
+| `x-erpnext-company` | Default company |
+
+HTTP headers take precedence over environment variables when both are present.
+
+---
+
+## Server Configuration
+
+These settings control the server itself (not your ERPNext connection):
+
+| Variable | Default | What it does |
+|----------|---------|--------------|
+| `TRANSPORT` | `stdio` | How clients connect: `stdio` for Claude Desktop, `http` for shared deployment |
+| `PORT` | `8000` | Port for HTTP mode |
+| `MCP_SERVER_API_KEY` | *(none)* | If set, clients must send a matching `x-api-key` header to connect |
+
+---
+
+## Security
+
+- **Credentials are never stored** by the server — they come from env vars or per-request headers
+- **Credentials are never logged** or included in error messages
+- **Per-session isolation** — each client connection gets its own ERPNext session, credentials are not shared
+- **Docker image runs as non-root** user (`app`)
+- **Optional API key protection** — set `MCP_SERVER_API_KEY` to require authentication for HTTP connections
+
+---
+
+## HTTP Endpoints (for advanced users)
+
+| Method | Path | What it does |
+|--------|------|--------------|
+| `POST/GET/DELETE` | `/mcp` | Main endpoint (StreamableHTTP protocol) |
+| `GET` | `/sse` | Server-Sent Events connection (legacy, single session) |
+| `POST` | `/messages` | SSE message endpoint (legacy) |
+| `GET` | `/health` | Health check — returns `{"status": "healthy"}` |
+
+---
 
 ## Development
 
 ```bash
+git clone https://github.com/RajeevGangwar/erpnext-mcp-server.git
+cd erpnext-mcp-server
 npm install
-npm run build
-npm run watch      # auto-rebuild on changes
-npm run inspector  # MCP Inspector for debugging
+npm run build        # compile TypeScript
+npm run watch        # auto-rebuild on changes
+npm run inspector    # MCP Inspector for debugging tools
 ```
 
-## Docker Deployment
+### Project Structure
 
-```bash
-docker build -t erpnext-mcp-server .
-docker run -p 8000:8000 \
-  -e TRANSPORT=http \
-  -e MCP_SERVER_API_KEY=your-mcp-auth-key \
-  erpnext-mcp-server
+```
+src/
+├── index.ts        # Entry point — picks transport mode, starts server
+├── client.ts       # ERPNext HTTP client (REST API wrapper)
+├── tools.ts        # MCP tool definitions and handlers
+├── resources.ts    # MCP resource definitions (document lookup)
+└── transport.ts    # HTTP/SSE/stdio transport setup
 ```
 
-No `ERPNEXT_*` env vars needed when using HTTP headers -- credentials come per-session from the client.
+---
 
-## HTTP Endpoints
+## License
 
-| Method | Path | Description |
-|---|---|---|
-| `POST/GET/DELETE` | `/mcp` | StreamableHTTP (primary) |
-| `GET` | `/sse` | Legacy SSE connection (single session) |
-| `POST` | `/messages` | Legacy SSE messages |
-| `GET` | `/health` | Health check |
-
-To secure the HTTP endpoint, set `MCP_SERVER_API_KEY` and pass `x-api-key` header in requests.
+MIT — see [LICENSE](LICENSE) for details.
