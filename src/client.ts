@@ -21,7 +21,7 @@ export class ERPNextClient {
 
     this.axiosInstance = axios.create({
       baseURL: this.baseUrl,
-      withCredentials: true,
+      timeout: 30000,
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
@@ -125,6 +125,9 @@ export class ERPNextClient {
         return [];
       } catch (altError: any) {
         console.error("Alternative DocType fetch failed:", altError?.message || 'Unknown error');
+        // Hardcoded fallback: common ERPNext DocTypes returned when both the
+        // /api/resource/DocType endpoint and the search_link method fail
+        // (e.g., permission restrictions on some Frappe Cloud plans).
         return [
           "Customer", "Supplier", "Item", "Sales Order", "Purchase Order",
           "Sales Invoice", "Purchase Invoice", "Employee", "Lead", "Opportunity",

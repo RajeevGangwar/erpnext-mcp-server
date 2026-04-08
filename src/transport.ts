@@ -11,12 +11,12 @@ import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
-import express from "express";
+import express, { Request } from "express";
 import cors from "cors";
 import { ERPNextConfig } from "./tools.js";
 
 /** Extract ERPNext credentials from request headers. */
-function extractConfig(req: any): ERPNextConfig {
+function extractConfig(req: Request): ERPNextConfig {
   return {
     url: req.headers["x-erpnext-url"] as string || undefined,
     apiKey: req.headers["x-erpnext-api-key"] as string || undefined,
@@ -54,6 +54,8 @@ export function startHTTP(
   });
 
   // ── StreamableHTTP: POST/GET/DELETE /mcp ─────────────────────────────
+  // TODO: Stale sessions are only cleaned up on explicit close/delete.
+  // For production, add a TTL-based reaper (e.g., evict sessions idle > 30 min).
 
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
@@ -114,10 +116,16 @@ export function startHTTP(
   });
 
   // ── Legacy SSE: GET /sse + POST /messages ────────────────────────────
+  // TODO: SSE transport only supports a single concurrent session.
+  // For production multi-session SSE, use StreamableHTTP (/mcp) instead.
 
   let sseTransport: SSEServerTransport | null = null;
 
   app.get("/sse", async (req, res) => {
+    if (sseTransport) {
+      res.status(409).json({ error: "SSE session already active. Only one concurrent SSE connection supported." });
+      return;
+    }
     sseTransport = new SSEServerTransport("/messages", res);
     const config = extractConfig(req);
     const server = createServer(config);

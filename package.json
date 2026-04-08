@@ -1,7 +1,7 @@
 {
-  "name": "erpnext-server",
-  "version": "0.1.0",
-  "description": "A Model Context Protocol server",
+  "name": "erpnext-mcp-server",
+  "version": "0.3.0",
+  "description": "MCP server for ERPNext/Frappe — multi-site, header-based auth",
   "private": true,
   "type": "module",
   "bin": {

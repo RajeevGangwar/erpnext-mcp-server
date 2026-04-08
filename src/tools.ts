@@ -14,6 +14,7 @@ import {
   ErrorCode,
   ListToolsRequestSchema,
   McpError,
+  Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { ERPNextClient } from "./client.js";
 import { registerResources } from "./resources.js";
@@ -57,12 +58,21 @@ export function createMCPServer(config?: ERPNextConfig): Server {
 
   function getClient(): ERPNextClient {
     if (client) return client;
-    throw new Error("Not connected. Provide credentials via x-erpnext-* headers or ERPNEXT_* env vars.");
+    throw new McpError(ErrorCode.InvalidRequest, "Not connected. Provide credentials via x-erpnext-* headers or ERPNEXT_* env vars.");
+  }
+
+  /** Return an authenticated client or throw an MCP error. */
+  function requireAuth(): ERPNextClient {
+    const c = getClient();
+    if (!c.isAuthenticated()) {
+      throw new McpError(ErrorCode.InvalidRequest, "Not authenticated. Provide credentials via x-erpnext-* headers or ERPNEXT_* env vars.");
+    }
+    return c;
   }
 
   // ── Register resources & tools ──────────────────────────────────────
   registerResources(server, getClient);
-  registerTools(server, getClient, () => company, (c) => { company = c; });
+  registerTools(server, requireAuth, () => company, (c) => { company = c; });
 
   return server;
 }
@@ -73,7 +83,7 @@ export function createMCPServer(config?: ERPNextConfig): Server {
 
 function registerTools(
   server: Server,
-  getClient: () => ERPNextClient,
+  requireAuth: () => ERPNextClient,
   getCompany: () => string | null,
   setCompany: (name: string | null) => void,
 ): void {
@@ -81,7 +91,7 @@ function registerTools(
   // ── Tool list ─────────────────────────────────────────────────────────
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools: any[] = [
+    const tools: Tool[] = [
       {
         name: "list_companies",
         description: "List all companies on the connected ERPNext site",
@@ -111,13 +121,25 @@ function registerTools(
       },
       {
         name: "get_doctype_fields",
-        description: "Get fields list for a specific DocType",
+        description: "Get the schema (fields list) for a specific DocType via the DocType meta API",
         inputSchema: {
           type: "object" as const,
           properties: {
             doctype: { type: "string", description: "ERPNext DocType (e.g., Customer, Item)" }
           },
           required: ["doctype"]
+        }
+      },
+      {
+        name: "get_document",
+        description: "Fetch a single document by DocType and name",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            doctype: { type: "string", description: "ERPNext DocType (e.g., Customer, Item)" },
+            name: { type: "string", description: "Document name/ID" }
+          },
+          required: ["doctype", "name"]
         }
       },
       {
@@ -204,12 +226,9 @@ function registerTools(
       // ── Session management tools ──────────────────────────────────────
 
       case "list_companies": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         try {
-          const companies = await client.getDocList("Company", {}, ["name", "default_currency", "country"], 100);
+          const companies = await client.getDocList("Company", undefined, ["name", "default_currency", "country"], 100);
           return { content: [{ type: "text", text: JSON.stringify(companies, null, 2) }] };
         } catch (error: any) {
           return { content: [{ type: "text", text: `Failed to list companies: ${error.message}` }], isError: true };
@@ -217,8 +236,18 @@ function registerTools(
       }
 
       case "set_company": {
-        const companyName = String(request.params.arguments?.company_name || "");
-        setCompany(companyName);
+        const name = String(request.params.arguments?.company_name || "");
+        if (!name) throw new McpError(ErrorCode.InvalidParams, "company_name is required");
+        const client = requireAuth();
+        try {
+          const matches = await client.getDocList("Company", { name }, ["name"], 1);
+          if (!matches.length) {
+            return { content: [{ type: "text", text: `Company "${name}" not found on this ERPNext site.` }], isError: true };
+          }
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Failed to verify company "${name}": ${error.message}` }], isError: true };
+        }
+        setCompany(name);
         return { content: [{ type: "text", text: JSON.stringify({
           status: "company_switched",
           active_company: getCompany(),
@@ -229,10 +258,7 @@ function registerTools(
       // ── ERPNext data tools ────────────────────────────────────────────
 
       case "get_doctypes": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         try {
           const doctypes = await client.getAllDocTypes();
           return { content: [{ type: "text", text: JSON.stringify(doctypes, null, 2) }] };
@@ -242,47 +268,57 @@ function registerTools(
       }
 
       case "get_doctype_fields": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         const doctype = String(request.params.arguments?.doctype);
         if (!doctype) {
-          throw new McpError(ErrorCode.InvalidParams, "Doctype is required");
+          throw new McpError(ErrorCode.InvalidParams, "doctype is required");
         }
         try {
-          const documents = await client.getDocList(doctype, {}, ["*"], 1);
-          if (!documents || documents.length === 0) {
-            return { content: [{ type: "text", text: `No documents found for ${doctype}. Cannot determine fields.` }], isError: true };
-          }
-          const sampleDoc = documents[0];
-          const fields = Object.keys(sampleDoc).map(field => ({
-            fieldname: field,
-            value: typeof sampleDoc[field],
-            sample: sampleDoc[field]?.toString()?.substring(0, 50) || null
+          const doc = await client.getDocument("DocType", doctype);
+          const fields = (doc.fields || []).map((f: any) => ({
+            fieldname: f.fieldname,
+            fieldtype: f.fieldtype,
+            label: f.label,
+            reqd: f.reqd || 0,
+            options: f.options || null,
           }));
           return { content: [{ type: "text", text: JSON.stringify(fields, null, 2) }] };
         } catch (error: any) {
-          return { content: [{ type: "text", text: `Failed to get fields for ${doctype}: ${error?.message || 'Unknown error'}` }], isError: true };
+          return { content: [{ type: "text", text: `Failed to get schema for ${doctype}: ${error?.message || 'Unknown error'}` }], isError: true };
+        }
+      }
+
+      case "get_document": {
+        const client = requireAuth();
+        const doctype = String(request.params.arguments?.doctype);
+        const name = String(request.params.arguments?.name);
+        if (!doctype || !name) {
+          throw new McpError(ErrorCode.InvalidParams, "doctype and name are required");
+        }
+        try {
+          const doc = await client.getDocument(doctype, name);
+          return { content: [{ type: "text", text: JSON.stringify(doc, null, 2) }] };
+        } catch (error: any) {
+          return { content: [{ type: "text", text: `Failed to get ${doctype} "${name}": ${error?.message || 'Unknown error'}` }], isError: true };
         }
       }
 
       case "get_documents": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         const doctype = String(request.params.arguments?.doctype);
         const fields = request.params.arguments?.fields as string[] | undefined;
-        let filters = request.params.arguments?.filters as Record<string, any> || {};
+        let filters = request.params.arguments?.filters as Record<string, any> | undefined;
         const limit = request.params.arguments?.limit as number || undefined;
         if (!doctype) {
-          throw new McpError(ErrorCode.InvalidParams, "Doctype is required");
+          throw new McpError(ErrorCode.InvalidParams, "doctype is required");
         }
-        // Auto-apply company filter
+        // Auto-apply company filter for transaction doctypes
         const activeCompany = getCompany();
-        if (activeCompany && !filters["company"] && COMPANY_DOCTYPES.has(doctype)) {
-          filters = { ...filters, company: activeCompany };
+        if (activeCompany && COMPANY_DOCTYPES.has(doctype)) {
+          if (!filters) filters = {};
+          if (!filters["company"]) {
+            filters = { ...filters, company: activeCompany };
+          }
         }
         try {
           const documents = await client.getDocList(doctype, filters, fields, limit);
@@ -293,18 +329,15 @@ function registerTools(
       }
 
       case "create_document": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         const doctype = String(request.params.arguments?.doctype);
         let data = request.params.arguments?.data as Record<string, any> | undefined;
         if (!doctype || !data) {
-          throw new McpError(ErrorCode.InvalidParams, "Doctype and data are required");
+          throw new McpError(ErrorCode.InvalidParams, "doctype and data are required");
         }
-        // Auto-set company
+        // Auto-set company only for doctypes that have a company field
         const activeCompany = getCompany();
-        if (activeCompany && !data["company"]) {
+        if (activeCompany && !data["company"] && COMPANY_DOCTYPES.has(doctype)) {
           data = { ...data, company: activeCompany };
         }
         try {
@@ -316,15 +349,12 @@ function registerTools(
       }
 
       case "update_document": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         const doctype = String(request.params.arguments?.doctype);
         const name = String(request.params.arguments?.name);
         const data = request.params.arguments?.data as Record<string, any> | undefined;
         if (!doctype || !name || !data) {
-          throw new McpError(ErrorCode.InvalidParams, "Doctype, name, and data are required");
+          throw new McpError(ErrorCode.InvalidParams, "doctype, name, and data are required");
         }
         try {
           const result = await client.updateDocument(doctype, name, data);
@@ -335,14 +365,11 @@ function registerTools(
       }
 
       case "run_report": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         const reportName = String(request.params.arguments?.report_name);
         const filters = request.params.arguments?.filters as Record<string, any> | undefined;
         if (!reportName) {
-          throw new McpError(ErrorCode.InvalidParams, "Report name is required");
+          throw new McpError(ErrorCode.InvalidParams, "report_name is required");
         }
         try {
           const result = await client.runReport(reportName, filters);
@@ -353,10 +380,7 @@ function registerTools(
       }
 
       case "call_method": {
-        const client = getClient();
-        if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
-        }
+        const client = requireAuth();
         const method = String(request.params.arguments?.method || "");
         const args = request.params.arguments?.args || {};
         try {

@@ -1,26 +1,34 @@
 # ERPNext MCP Server
 
-A Model Context Protocol server for ERPNext integration. Connects AI assistants to any ERPNext/Frappe site via the MCP protocol. Supports both **stdio** (Claude Desktop) and **HTTP/SSE** (Periscope, remote deployment) transports.
+MCP server for ERPNext/Frappe -- multi-site, header-based auth. Connects AI assistants to any ERPNext instance via the [Model Context Protocol](https://modelcontextprotocol.io). Supports **stdio** (Claude Desktop), **StreamableHTTP**, and **legacy SSE** transports.
 
 ## Credential Modes
 
 | Mode | How credentials arrive | Use case |
 |---|---|---|
-| **HTTP headers** | `x-erpnext-url`, `x-erpnext-api-key`, `x-erpnext-api-secret`, `x-erpnext-company` | Periscope (Authentication JSON), multi-site |
+| **HTTP headers** | `x-erpnext-url`, `x-erpnext-api-key`, `x-erpnext-api-secret`, `x-erpnext-company` | Periscope / remote deployment, multi-site |
 | **Environment variables** | `ERPNEXT_URL`, `ERPNEXT_API_KEY`, `ERPNEXT_API_SECRET`, `ERPNEXT_COMPANY` | stdio / Claude Desktop, single-site |
 
 HTTP headers take precedence. If no headers are provided, env vars are used as fallback.
 
 One container can serve unlimited ERPNext sites -- each session gets credentials from its own request headers.
 
-## Tools (8)
+## Security Notes
+
+- The Docker image runs as a non-root user (`app`).
+- Set `MCP_SERVER_API_KEY` to protect the HTTP endpoint; requests must include a matching `x-api-key` header.
+- Credentials are scoped per session -- they are never shared across connections.
+- The SSE transport supports only one concurrent connection; use StreamableHTTP (`/mcp`) for production multi-session use.
+
+## Tools (10)
 
 | Tool | Description |
 |---|---|
 | `list_companies` | List all companies on the connected ERPNext site |
-| `set_company` | Switch active company context (auto-filters transactions) |
+| `set_company` | Switch active company context (validates company exists, auto-filters transactions) |
 | `get_doctypes` | List all available DocTypes |
-| `get_doctype_fields` | Get fields for a specific DocType |
+| `get_doctype_fields` | Get the schema (field definitions) for a DocType via the meta API |
+| `get_document` | Fetch a single document by DocType and name |
 | `get_documents` | Query documents with filters, field selection, limits |
 | `create_document` | Create a new document |
 | `update_document` | Update an existing document |
@@ -31,7 +39,7 @@ One container can serve unlimited ERPNext sites -- each session gets credentials
 
 When a company is active (via `set_company` or `x-erpnext-company` header), `get_documents` automatically adds a `company` filter for transaction doctypes (Sales Order, Purchase Order, Work Order, BOM, etc.). Master data doctypes (Item, Supplier, Customer) are not filtered since they are shared across companies.
 
-Similarly, `create_document` auto-sets the `company` field if not explicitly provided.
+Similarly, `create_document` auto-sets the `company` field for transaction doctypes only -- it will not add a company field to master data documents.
 
 ## Resources
 
@@ -91,14 +99,13 @@ Add to your Claude Desktop config (`%APPDATA%/Claude/claude_desktop_config.json`
 ```bash
 npm install
 npm run build
-npm run watch    # auto-rebuild on changes
+npm run watch      # auto-rebuild on changes
 npm run inspector  # MCP Inspector for debugging
 ```
 
 ## Docker Deployment
 
 ```bash
-npm run build
 docker build -t erpnext-mcp-server .
 docker run -p 8000:8000 \
   -e TRANSPORT=http \
@@ -113,7 +120,7 @@ No `ERPNEXT_*` env vars needed when using HTTP headers -- credentials come per-s
 | Method | Path | Description |
 |---|---|---|
 | `POST/GET/DELETE` | `/mcp` | StreamableHTTP (primary) |
-| `GET` | `/sse` | Legacy SSE connection |
+| `GET` | `/sse` | Legacy SSE connection (single session) |
 | `POST` | `/messages` | Legacy SSE messages |
 | `GET` | `/health` | Health check |
 
