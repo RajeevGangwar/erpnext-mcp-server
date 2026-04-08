@@ -23,6 +23,7 @@ import {
   ReadResourceRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
+import { CosmosClient } from "@azure/cosmos";
 import express from "express";
 import cors from "cors";
 
@@ -32,18 +33,15 @@ class ERPNextClient {
   private axiosInstance: AxiosInstance;
   private authenticated: boolean = false;
 
-  constructor() {
-    // Get ERPNext configuration from environment variables
-    this.baseUrl = process.env.ERPNEXT_URL || '';
-    
+  constructor(url?: string, apiKey?: string, apiSecret?: string) {
+    // Use provided values or fall back to environment variables
+    this.baseUrl = (url || process.env.ERPNEXT_URL || '').replace(/\/$/, '');
+
     // Validate configuration
     if (!this.baseUrl) {
-      throw new Error("ERPNEXT_URL environment variable is required");
+      throw new Error("ERPNext URL is required (pass directly or set ERPNEXT_URL)");
     }
-    
-    // Remove trailing slash if present
-    this.baseUrl = this.baseUrl.replace(/\/$/, '');
-    
+
     // Initialize axios instance
     this.axiosInstance = axios.create({
       baseURL: this.baseUrl,
@@ -53,14 +51,14 @@ class ERPNextClient {
         'Accept': 'application/json'
       }
     });
-    
+
     // Configure authentication if credentials provided
-    const apiKey = process.env.ERPNEXT_API_KEY;
-    const apiSecret = process.env.ERPNEXT_API_SECRET;
-    
-    if (apiKey && apiSecret) {
-      this.axiosInstance.defaults.headers.common['Authorization'] = 
-        `token ${apiKey}:${apiSecret}`;
+    const key = apiKey || process.env.ERPNEXT_API_KEY;
+    const secret = apiSecret || process.env.ERPNEXT_API_SECRET;
+
+    if (key && secret) {
+      this.axiosInstance.defaults.headers.common['Authorization'] =
+        `token ${key}:${secret}`;
       this.authenticated = true;
     }
   }
@@ -198,8 +196,30 @@ class ERPNextClient {
 // Cache for doctype metadata
 const doctypeCache = new Map<string, any>();
 
-// Initialize ERPNext client
+// --- Cosmos DB multi-company support ---
+
+// Cosmos DB connection for company credential lookup
+function getCosmosContainer() {
+  const endpoint = process.env.COSMOS_ENDPOINT;
+  const key = process.env.COSMOS_KEY;
+  const database = process.env.COSMOS_DATABASE || "erp-demo-studio";
+  if (!endpoint || !key) return null;
+  const client = new CosmosClient({ endpoint, key });
+  return client.database(database).container("companies");
+}
+
+// Session state — set by connect tool, used by all other tools
+let sessionClient: ERPNextClient | null = null;
+let sessionCompany: string | null = null;  // company name for auto-filtering
+
+// Initialize default ERPNext client (from env vars)
 const erpnext = new ERPNextClient();
+
+// Get the active ERPNext client (session or default env-var client)
+function getClient(): ERPNextClient {
+  if (sessionClient) return sessionClient;
+  return erpnext;  // fall back to env-var initialized client
+}
 
 // Create an MCP server with capabilities for resources and tools
 const server = new Server(
@@ -268,10 +288,12 @@ server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
  * Handler for reading ERPNext resources.
  */
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
-  if (!erpnext.isAuthenticated()) {
+  const client = getClient();
+
+  if (!client.isAuthenticated()) {
     throw new McpError(
       ErrorCode.InvalidRequest,
-      "Not authenticated with ERPNext. Please configure API key authentication."
+      "Not authenticated with ERPNext. Call connect or configure API key authentication."
     );
   }
 
@@ -281,7 +303,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   // Handle special resource: erpnext://DocTypes (list of all doctypes)
   if (uri === "erpnext://DocTypes") {
     try {
-      const doctypes = await erpnext.getAllDocTypes();
+      const doctypes = await client.getAllDocTypes();
       result = { doctypes };
     } catch (error: any) {
       throw new McpError(
@@ -295,9 +317,9 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     if (documentMatch) {
       const doctype = decodeURIComponent(documentMatch[1]);
       const name = decodeURIComponent(documentMatch[2]);
-      
+
       try {
-        result = await erpnext.getDocument(doctype, name);
+        result = await client.getDocument(doctype, name);
       } catch (error: any) {
         throw new McpError(
           ErrorCode.InvalidRequest,
@@ -330,6 +352,36 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: "connect",
+        description: "Connect to an ERPNext site using company credentials from Cosmos DB. Call this first to set up the session. All subsequent tool calls will use this connection.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            company_id: { type: "string", description: "Company ID from erp-demo-studio Cosmos DB" }
+          },
+          required: ["company_id"]
+        }
+      },
+      {
+        name: "list_companies",
+        description: "List all available companies from the erp-demo-studio Cosmos DB",
+        inputSchema: {
+          type: "object" as const,
+          properties: {}
+        }
+      },
+      {
+        name: "set_company",
+        description: "Switch the active company context within the current site connection. Use this to query a different company's data on the same ERPNext site.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            company_name: { type: "string", description: "ERPNext company name (e.g., 'TechVolt Electronics')" }
+          },
+          required: ["company_name"]
+        }
+      },
+      {
         name: "get_doctypes",
         description: "Get a list of all available DocTypes",
         inputSchema: {
@@ -348,7 +400,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               description: "ERPNext DocType (e.g., Customer, Item)"
             }
           },
-            required: ["doctype"]
+          required: ["doctype"]
         }
       },
       {
@@ -458,36 +510,110 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
+// DocTypes that have a company field (transaction/company-scoped docs).
+// Master data (Item, Supplier, Customer) is shared across companies.
+const COMPANY_DOCTYPES = new Set([
+  "Sales Order", "Delivery Note", "Sales Invoice",
+  "Purchase Order", "Purchase Receipt", "Purchase Invoice",
+  "Payment Entry", "Stock Entry", "Stock Reconciliation",
+  "Work Order", "BOM", "Journal Entry", "Bin",
+  "Material Request", "Quality Inspection"
+]);
+
 /**
  * Handler for tool calls.
  */
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   switch (request.params.name) {
+    // --- Session management tools ---
+
+    case "connect": {
+      const companyId = String(request.params.arguments?.company_id || "");
+      const container = getCosmosContainer();
+      if (!container) {
+        return { content: [{ type: "text", text: "Error: Cosmos DB not configured. Set COSMOS_ENDPOINT and COSMOS_KEY environment variables." }] };
+      }
+      try {
+        const { resource: company } = await container.item(companyId, companyId).read();
+        if (!company) {
+          return { content: [{ type: "text", text: `Error: Company ${companyId} not found in Cosmos DB.` }] };
+        }
+        const config = company.erp_config || {};
+        if (!config.site_url || !config.api_key || !config.api_secret) {
+          return { content: [{ type: "text", text: `Error: Company ${companyId} missing erp_config credentials (site_url, api_key, api_secret).` }] };
+        }
+        sessionClient = new ERPNextClient(config.site_url, config.api_key, config.api_secret);
+        sessionCompany = company.name || null;
+        return { content: [{ type: "text", text: JSON.stringify({
+          status: "connected",
+          company: company.name,
+          site_url: config.site_url,
+          active_company: sessionCompany,
+        }, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error connecting: ${error.message}` }] };
+      }
+    }
+
+    case "list_companies": {
+      const container = getCosmosContainer();
+      if (!container) {
+        return { content: [{ type: "text", text: "Error: Cosmos DB not configured." }] };
+      }
+      try {
+        const { resources } = await container.items.query(
+          "SELECT c.id, c.name, c.industry, c.country, c.currency, c.erp_config.site_url FROM c ORDER BY c.created_at DESC"
+        ).fetchAll();
+        return { content: [{ type: "text", text: JSON.stringify(resources, null, 2) }] };
+      } catch (error: any) {
+        return { content: [{ type: "text", text: `Error listing companies: ${error.message}` }] };
+      }
+    }
+
+    case "set_company": {
+      const companyName = String(request.params.arguments?.company_name || "");
+      sessionCompany = companyName;
+      return { content: [{ type: "text", text: JSON.stringify({
+        status: "company_switched",
+        active_company: sessionCompany,
+        note: "All subsequent queries will filter by this company where applicable."
+      }, null, 2) }] };
+    }
+
+    // --- ERPNext data tools ---
+
     case "get_documents": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
           content: [{
             type: "text",
-            text: "Not authenticated with ERPNext. Please configure API key authentication."
+            text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY."
           }],
           isError: true
         };
       }
-      
+
       const doctype = String(request.params.arguments?.doctype);
       const fields = request.params.arguments?.fields as string[] | undefined;
-      const filters = request.params.arguments?.filters as Record<string, any> | undefined;
-      const limit = request.params.arguments?.limit as number | undefined;
-      
+      let filters = request.params.arguments?.filters as Record<string, any> || {};
+      const limit = request.params.arguments?.limit as number || undefined;
+
       if (!doctype) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Doctype is required"
         );
       }
-      
+
+      // Auto-apply company filter if session company is set and not already filtered
+      if (sessionCompany && !filters["company"] && COMPANY_DOCTYPES.has(doctype)) {
+        filters = { ...filters, company: sessionCompany };
+      }
+
       try {
-        const documents = await erpnext.getDocList(doctype, filters, fields, limit);
+        const documents = await client.getDocList(doctype, filters, fields, limit);
         return {
           content: [{
             type: "text",
@@ -504,30 +630,37 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-    
+
     case "create_document": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
           content: [{
             type: "text",
-            text: "Not authenticated with ERPNext. Please configure API key authentication."
+            text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY."
           }],
           isError: true
         };
       }
-      
+
       const doctype = String(request.params.arguments?.doctype);
-      const data = request.params.arguments?.data as Record<string, any> | undefined;
-      
+      let data = request.params.arguments?.data as Record<string, any> | undefined;
+
       if (!doctype || !data) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Doctype and data are required"
         );
       }
-      
+
+      // Auto-set company if session company is set and not already in data
+      if (sessionCompany && !data["company"]) {
+        data = { ...data, company: sessionCompany };
+      }
+
       try {
-        const result = await erpnext.createDocument(doctype, data);
+        const result = await client.createDocument(doctype, data);
         return {
           content: [{
             type: "text",
@@ -544,31 +677,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-    
+
     case "update_document": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
           content: [{
             type: "text",
-            text: "Not authenticated with ERPNext. Please configure API key authentication."
+            text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY."
           }],
           isError: true
         };
       }
-      
+
       const doctype = String(request.params.arguments?.doctype);
       const name = String(request.params.arguments?.name);
       const data = request.params.arguments?.data as Record<string, any> | undefined;
-      
+
       if (!doctype || !name || !data) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Doctype, name, and data are required"
         );
       }
-      
+
       try {
-        const result = await erpnext.updateDocument(doctype, name, data);
+        const result = await client.updateDocument(doctype, name, data);
         return {
           content: [{
             type: "text",
@@ -585,30 +720,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-    
+
     case "run_report": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
           content: [{
             type: "text",
-            text: "Not authenticated with ERPNext. Please configure API key authentication."
+            text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY."
           }],
           isError: true
         };
       }
-      
+
       const reportName = String(request.params.arguments?.report_name);
       const filters = request.params.arguments?.filters as Record<string, any> | undefined;
-      
+
       if (!reportName) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Report name is required"
         );
       }
-      
+
       try {
-        const result = await erpnext.runReport(reportName, filters);
+        const result = await client.runReport(reportName, filters);
         return {
           content: [{
             type: "text",
@@ -625,31 +762,33 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-    
+
     case "get_doctype_fields": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
           content: [{
             type: "text",
-            text: "Not authenticated with ERPNext. Please configure API key authentication."
+            text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY."
           }],
           isError: true
         };
       }
-      
+
       const doctype = String(request.params.arguments?.doctype);
-      
+
       if (!doctype) {
         throw new McpError(
           ErrorCode.InvalidParams,
           "Doctype is required"
         );
       }
-      
+
       try {
         // Get a sample document to understand the fields
-        const documents = await erpnext.getDocList(doctype, {}, ["*"], 1);
-        
+        const documents = await client.getDocList(doctype, {}, ["*"], 1);
+
         if (!documents || documents.length === 0) {
           return {
             content: [{
@@ -659,7 +798,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             isError: true
           };
         }
-        
+
         // Extract field names from the first document
         const sampleDoc = documents[0];
         const fields = Object.keys(sampleDoc).map(field => ({
@@ -667,7 +806,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           value: typeof sampleDoc[field],
           sample: sampleDoc[field]?.toString()?.substring(0, 50) || null
         }));
-        
+
         return {
           content: [{
             type: "text",
@@ -684,18 +823,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-    
+
     case "call_method": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
-          content: [{ type: "text", text: "Error: Not authenticated. Set ERPNEXT_API_KEY and ERPNEXT_API_SECRET." }],
+          content: [{ type: "text", text: "Error: Not authenticated. Call connect or set ERPNEXT_API_KEY and ERPNEXT_API_SECRET." }],
           isError: true
         };
       }
       const method = String(request.params.arguments?.method || "");
       const args = request.params.arguments?.args || {};
       try {
-        const response = await erpnext.getAxiosInstance().post(`/api/method/${method}`, args);
+        const response = await client.getAxiosInstance().post(`/api/method/${method}`, args);
         return {
           content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }]
         };
@@ -708,18 +849,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case "get_doctypes": {
-      if (!erpnext.isAuthenticated()) {
+      const client = getClient();
+
+      if (!client.isAuthenticated()) {
         return {
           content: [{
             type: "text",
-            text: "Not authenticated with ERPNext. Please configure API key authentication."
+            text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY."
           }],
           isError: true
         };
       }
-      
+
       try {
-        const doctypes = await erpnext.getAllDocTypes();
+        const doctypes = await client.getAllDocTypes();
         return {
           content: [{
             type: "text",
@@ -736,7 +879,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
     }
-      
+
     default:
       throw new McpError(
         ErrorCode.MethodNotFound,
