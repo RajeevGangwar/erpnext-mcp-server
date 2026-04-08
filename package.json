@@ -17,11 +17,9 @@
     "inspector": "npx @modelcontextprotocol/inspector build/index.js"
   },
   "dependencies": {
-    "@azure/cosmos": "^4.9.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.8.4",
     "cors": "^2.8.6",
-    "eventsource": "^2.0.2",
     "express": "^5.2.1"
   },
   "devDependencies": {

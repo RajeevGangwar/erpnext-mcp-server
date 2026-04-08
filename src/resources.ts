@@ -51,7 +51,7 @@ export function registerResources(
     if (!client.isAuthenticated()) {
       throw new McpError(
         ErrorCode.InvalidRequest,
-        "Not authenticated with ERPNext. Call connect or configure API key authentication."
+        "Not authenticated with ERPNext. Provide credentials via headers or env vars."
       );
     }
 

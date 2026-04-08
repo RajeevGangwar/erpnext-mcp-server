@@ -2,6 +2,7 @@
  * Transport Setup
  *
  * Express app with StreamableHTTP, legacy SSE, and stdio transports.
+ * HTTP transports extract ERPNext credentials from x-erpnext-* request headers.
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -12,13 +13,27 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import cors from "cors";
+import { ERPNextConfig } from "./tools.js";
+
+/** Extract ERPNext credentials from request headers. */
+function extractConfig(req: any): ERPNextConfig {
+  return {
+    url: req.headers["x-erpnext-url"] as string || undefined,
+    apiKey: req.headers["x-erpnext-api-key"] as string || undefined,
+    apiSecret: req.headers["x-erpnext-api-secret"] as string || undefined,
+    company: req.headers["x-erpnext-company"] as string || undefined,
+  };
+}
 
 /**
  * Start HTTP transport (StreamableHTTP + legacy SSE).
  * @param createServer Factory that returns a fresh MCP Server per session.
  * @param port Port to listen on.
  */
-export function startHTTP(createServer: () => Server, port: number): void {
+export function startHTTP(
+  createServer: (config?: ERPNextConfig) => Server,
+  port: number
+): void {
   const app = express();
   app.use(cors());
   app.use(express.json());
@@ -65,8 +80,9 @@ export function startHTTP(createServer: () => Server, port: number): void {
         if (sid) delete transports[sid];
       };
 
-      // Each session gets its own server instance
-      const server = createServer();
+      // Each session gets its own server instance with credentials from headers
+      const config = extractConfig(req);
+      const server = createServer(config);
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
       return;
@@ -101,9 +117,10 @@ export function startHTTP(createServer: () => Server, port: number): void {
 
   let sseTransport: SSEServerTransport | null = null;
 
-  app.get("/sse", async (_req, res) => {
+  app.get("/sse", async (req, res) => {
     sseTransport = new SSEServerTransport("/messages", res);
-    const server = createServer();
+    const config = extractConfig(req);
+    const server = createServer(config);
     await server.connect(sseTransport);
   });
 
@@ -127,11 +144,14 @@ export function startHTTP(createServer: () => Server, port: number): void {
 
 /**
  * Start stdio transport (single session).
+ * Credentials come from ERPNEXT_* env vars (no headers available).
  * @param createServer Factory that returns a configured MCP Server.
  */
-export async function startStdio(createServer: () => Server): Promise<void> {
+export async function startStdio(
+  createServer: (config?: ERPNextConfig) => Server
+): Promise<void> {
   const transport = new StdioServerTransport();
-  const server = createServer();
+  const server = createServer();  // no config = env vars
   await server.connect(transport);
   console.error("ERPNext MCP server running on stdio");
 }

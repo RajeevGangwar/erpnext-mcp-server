@@ -2,8 +2,7 @@
  * MCP Tool Definitions & Handlers
  *
  * Registers all ERPNext tools on a Server instance.
- * Session management tools (connect, list_companies, set_company) are only
- * registered when a CredentialResolver is provided.
+ * Credentials come from ERPNextConfig (populated from HTTP headers or env vars).
  *
  * createMCPServer() is the main factory: builds a Server with per-instance
  * session state (client + company context).
@@ -17,8 +16,15 @@ import {
   McpError,
 } from "@modelcontextprotocol/sdk/types.js";
 import { ERPNextClient } from "./client.js";
-import { CredentialResolver } from "./credentials.js";
 import { registerResources } from "./resources.js";
+
+/** Credentials passed from HTTP headers or env vars. */
+export interface ERPNextConfig {
+  url?: string;
+  apiKey?: string;
+  apiSecret?: string;
+  company?: string;
+}
 
 /** DocTypes that have a company field (transaction/company-scoped docs). */
 const COMPANY_DOCTYPES = new Set([
@@ -29,55 +35,34 @@ const COMPANY_DOCTYPES = new Set([
   "Material Request", "Quality Inspection"
 ]);
 
-/** Callbacks for mutating per-instance session state from tool handlers. */
-interface SessionAccessors {
-  getClient: () => ERPNextClient;
-  setClient: (client: ERPNextClient) => void;
-  getCompany: () => string | null;
-  setCompany: (name: string | null) => void;
-}
-
 /**
  * Creates a fully configured MCP Server with per-instance session state.
+ * @param config Optional credentials from HTTP headers; falls back to env vars.
  */
-export function createMCPServer(resolver?: CredentialResolver): Server {
+export function createMCPServer(config?: ERPNextConfig): Server {
   const server = new Server(
-    { name: "erpnext-mcp-server", version: "0.2.0" },
+    { name: "erpnext-mcp-server", version: "0.3.0" },
     { capabilities: { tools: {}, resources: {} } }
   );
 
   // ── Per-instance session state ──────────────────────────────────────
-  let sessionClient: ERPNextClient | null = null;
-  let sessionCompany: string | null = null;
-
-  // Default client from env vars (optional, works without Cosmos)
-  let envClient: ERPNextClient | null = null;
+  let client: ERPNextClient | null = null;
   try {
-    envClient = new ERPNextClient();
+    client = new ERPNextClient(config?.url, config?.apiKey, config?.apiSecret);
   } catch {
-    // No env vars set -- use connect() tool instead
+    // No credentials available yet -- tools will return auth errors
   }
 
-  const accessors: SessionAccessors = {
-    getClient(): ERPNextClient {
-      if (sessionClient) return sessionClient;
-      if (envClient) return envClient;
-      throw new Error("Not connected. Call the 'connect' tool with a company_id first, or set ERPNEXT_URL env var.");
-    },
-    setClient(client: ERPNextClient): void {
-      sessionClient = client;
-    },
-    getCompany(): string | null {
-      return sessionCompany;
-    },
-    setCompany(name: string | null): void {
-      sessionCompany = name;
-    },
-  };
+  let company: string | null = config?.company || process.env.ERPNEXT_COMPANY || null;
+
+  function getClient(): ERPNextClient {
+    if (client) return client;
+    throw new Error("Not connected. Provide credentials via x-erpnext-* headers or ERPNEXT_* env vars.");
+  }
 
   // ── Register resources & tools ──────────────────────────────────────
-  registerResources(server, accessors.getClient);
-  registerTools(server, accessors, resolver);
+  registerResources(server, getClient);
+  registerTools(server, getClient, () => company, (c) => { company = c; });
 
   return server;
 }
@@ -88,55 +73,34 @@ export function createMCPServer(resolver?: CredentialResolver): Server {
 
 function registerTools(
   server: Server,
-  session: SessionAccessors,
-  resolver?: CredentialResolver,
+  getClient: () => ERPNextClient,
+  getCompany: () => string | null,
+  setCompany: (name: string | null) => void,
 ): void {
-
-  const { getClient, setClient, getCompany, setCompany } = session;
 
   // ── Tool list ─────────────────────────────────────────────────────────
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const tools: any[] = [];
-
-    // Session management tools -- only if a resolver is available
-    if (resolver) {
-      tools.push(
-        {
-          name: "connect",
-          description: "Connect to an ERPNext site using company credentials from the credential store. Call this first to set up the session. All subsequent tool calls will use this connection.",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              company_id: { type: "string", description: "Company ID from the credential store" }
-            },
-            required: ["company_id"]
-          }
-        },
-        {
-          name: "list_companies",
-          description: "List all available companies from the credential store",
-          inputSchema: {
-            type: "object" as const,
-            properties: {}
-          }
-        },
-        {
-          name: "set_company",
-          description: "Switch the active company context within the current site connection. Use this to query a different company's data on the same ERPNext site.",
-          inputSchema: {
-            type: "object" as const,
-            properties: {
-              company_name: { type: "string", description: "ERPNext company name (e.g., 'TechVolt Electronics')" }
-            },
-            required: ["company_name"]
-          }
-        },
-      );
-    }
-
-    // ERPNext data tools -- always available
-    tools.push(
+    const tools: any[] = [
+      {
+        name: "list_companies",
+        description: "List all companies on the connected ERPNext site",
+        inputSchema: {
+          type: "object" as const,
+          properties: {}
+        }
+      },
+      {
+        name: "set_company",
+        description: "Switch the active company context within the current site connection. Use this to query a different company's data on the same ERPNext site.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            company_name: { type: "string", description: "ERPNext company name (e.g., 'TechVolt Electronics')" }
+          },
+          required: ["company_name"]
+        }
+      },
       {
         name: "get_doctypes",
         description: "Get a list of all available DocTypes",
@@ -227,7 +191,7 @@ function registerTools(
           required: ["method"]
         }
       },
-    );
+    ];
 
     return { tools };
   });
@@ -239,35 +203,16 @@ function registerTools(
 
       // ── Session management tools ──────────────────────────────────────
 
-      case "connect": {
-        if (!resolver) {
-          throw new McpError(ErrorCode.MethodNotFound, "connect tool requires a credential resolver");
-        }
-        const companyId = String(request.params.arguments?.company_id || "");
-        try {
-          const creds = await resolver.getCredentials(companyId);
-          setClient(new ERPNextClient(creds.url, creds.apiKey, creds.apiSecret));
-          setCompany(creds.company || null);
-          return { content: [{ type: "text", text: JSON.stringify({
-            status: "connected",
-            company: creds.company,
-            site_url: creds.url,
-            active_company: getCompany(),
-          }, null, 2) }] };
-        } catch (error: any) {
-          return { content: [{ type: "text", text: `Error connecting: ${error.message}` }] };
-        }
-      }
-
       case "list_companies": {
-        if (!resolver) {
-          throw new McpError(ErrorCode.MethodNotFound, "list_companies tool requires a credential resolver");
+        const client = getClient();
+        if (!client.isAuthenticated()) {
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         try {
-          const connections = await resolver.listConnections();
-          return { content: [{ type: "text", text: JSON.stringify(connections, null, 2) }] };
+          const companies = await client.getDocList("Company", {}, ["name", "default_currency", "country"], 100);
+          return { content: [{ type: "text", text: JSON.stringify(companies, null, 2) }] };
         } catch (error: any) {
-          return { content: [{ type: "text", text: `Error listing companies: ${error.message}` }] };
+          return { content: [{ type: "text", text: `Failed to list companies: ${error.message}` }], isError: true };
         }
       }
 
@@ -286,7 +231,7 @@ function registerTools(
       case "get_doctypes": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         try {
           const doctypes = await client.getAllDocTypes();
@@ -299,7 +244,7 @@ function registerTools(
       case "get_doctype_fields": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         const doctype = String(request.params.arguments?.doctype);
         if (!doctype) {
@@ -325,7 +270,7 @@ function registerTools(
       case "get_documents": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         const doctype = String(request.params.arguments?.doctype);
         const fields = request.params.arguments?.fields as string[] | undefined;
@@ -335,9 +280,9 @@ function registerTools(
           throw new McpError(ErrorCode.InvalidParams, "Doctype is required");
         }
         // Auto-apply company filter
-        const company = getCompany();
-        if (company && !filters["company"] && COMPANY_DOCTYPES.has(doctype)) {
-          filters = { ...filters, company };
+        const activeCompany = getCompany();
+        if (activeCompany && !filters["company"] && COMPANY_DOCTYPES.has(doctype)) {
+          filters = { ...filters, company: activeCompany };
         }
         try {
           const documents = await client.getDocList(doctype, filters, fields, limit);
@@ -350,7 +295,7 @@ function registerTools(
       case "create_document": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         const doctype = String(request.params.arguments?.doctype);
         let data = request.params.arguments?.data as Record<string, any> | undefined;
@@ -358,9 +303,9 @@ function registerTools(
           throw new McpError(ErrorCode.InvalidParams, "Doctype and data are required");
         }
         // Auto-set company
-        const company = getCompany();
-        if (company && !data["company"]) {
-          data = { ...data, company };
+        const activeCompany = getCompany();
+        if (activeCompany && !data["company"]) {
+          data = { ...data, company: activeCompany };
         }
         try {
           const result = await client.createDocument(doctype, data);
@@ -373,7 +318,7 @@ function registerTools(
       case "update_document": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         const doctype = String(request.params.arguments?.doctype);
         const name = String(request.params.arguments?.name);
@@ -392,7 +337,7 @@ function registerTools(
       case "run_report": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Not authenticated with ERPNext. Call connect or set ERPNEXT_API_KEY." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         const reportName = String(request.params.arguments?.report_name);
         const filters = request.params.arguments?.filters as Record<string, any> | undefined;
@@ -410,7 +355,7 @@ function registerTools(
       case "call_method": {
         const client = getClient();
         if (!client.isAuthenticated()) {
-          return { content: [{ type: "text", text: "Error: Not authenticated. Call connect or set ERPNEXT_API_KEY and ERPNEXT_API_SECRET." }], isError: true };
+          return { content: [{ type: "text", text: "Not authenticated. Provide credentials via headers or env vars." }], isError: true };
         }
         const method = String(request.params.arguments?.method || "");
         const args = request.params.arguments?.args || {};
