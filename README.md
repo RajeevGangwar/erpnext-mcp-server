@@ -21,7 +21,7 @@ Once connected, your AI assistant can:
 **Step 1:** Clone and build the server
 
 ```bash
-git clone https://github.com/RajeevGangwar/erpnext-mcp-server.git
+git clone https://github.com/rakeshgangwar/erpnext-mcp-server.git
 cd erpnext-mcp-server
 npm install
 npm run build
@@ -191,7 +191,7 @@ These settings control the server itself (not your ERPNext connection):
 ## Development
 
 ```bash
-git clone https://github.com/RajeevGangwar/erpnext-mcp-server.git
+git clone https://github.com/rakeshgangwar/erpnext-mcp-server.git
 cd erpnext-mcp-server
 npm install
 npm run build        # compile TypeScript
