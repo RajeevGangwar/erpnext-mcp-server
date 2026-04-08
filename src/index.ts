@@ -12,6 +12,7 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import {
   CallToolRequestSchema,
   ErrorCode,
@@ -22,6 +23,8 @@ import {
   ReadResourceRequestSchema
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance } from "axios";
+import express from "express";
+import cors from "cors";
 
 // ERPNext API client configuration
 class ERPNextClient {
@@ -64,6 +67,10 @@ class ERPNextClient {
 
   isAuthenticated(): boolean {
     return this.authenticated;
+  }
+
+  getAxiosInstance(): AxiosInstance {
+    return this.axiosInstance;
   }
 
   // Get a document by doctype and name
@@ -434,6 +441,18 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["report_name"]
         }
+      },
+      {
+        name: "call_method",
+        description: "Call a whitelisted Frappe/ERPNext server method (e.g., erpnext.manufacturing.doctype.bom.bom.get_bom_items)",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            method: { type: "string", description: "Full dotted method path" },
+            args: { type: "object", description: "Method arguments (optional)" }
+          },
+          required: ["method"]
+        }
       }
     ]
   };
@@ -666,6 +685,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     }
     
+    case "call_method": {
+      if (!erpnext.isAuthenticated()) {
+        return {
+          content: [{ type: "text", text: "Error: Not authenticated. Set ERPNEXT_API_KEY and ERPNEXT_API_SECRET." }],
+          isError: true
+        };
+      }
+      const method = String(request.params.arguments?.method || "");
+      const args = request.params.arguments?.args || {};
+      try {
+        const response = await erpnext.getAxiosInstance().post(`/api/method/${method}`, args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(response.data, null, 2) }]
+        };
+      } catch (error: any) {
+        return {
+          content: [{ type: "text", text: `Error calling method ${method}: ${error.response?.data?.message || error.message}` }],
+          isError: true
+        };
+      }
+    }
+
     case "get_doctypes": {
       if (!erpnext.isAuthenticated()) {
         return {
@@ -705,12 +746,57 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 /**
- * Start the server using stdio transport.
+ * Start the server using the configured transport.
+ * Set TRANSPORT=sse for HTTP/SSE mode, otherwise defaults to stdio.
  */
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error('ERPNext MCP server running on stdio');
+  const transportType = process.env.TRANSPORT || "stdio";
+
+  if (transportType === "sse") {
+    const app = express();
+    app.use(cors());
+    app.use(express.json());
+
+    // API key auth middleware
+    app.use((req, res, next) => {
+      const expected = process.env.MCP_SERVER_API_KEY;
+      if (expected && req.headers["x-api-key"] !== expected) {
+        res.status(401).json({ error: "Unauthorized" });
+        return;
+      }
+      next();
+    });
+
+    // Health endpoint
+    app.get("/health", (_req, res) => {
+      res.json({ status: "healthy", service: "erpnext-mcp-server", transport: "sse" });
+    });
+
+    let sseTransport: SSEServerTransport | null = null;
+
+    app.get("/sse", async (_req, res) => {
+      sseTransport = new SSEServerTransport("/messages", res);
+      await server.connect(sseTransport);
+    });
+
+    app.post("/messages", async (req, res) => {
+      if (sseTransport) {
+        await sseTransport.handlePostMessage(req, res);
+      } else {
+        res.status(400).json({ error: "No SSE connection established" });
+      }
+    });
+
+    const PORT = parseInt(process.env.PORT || "8000");
+    app.listen(PORT, () => {
+      console.error(`ERPNext MCP server running on http://0.0.0.0:${PORT} (SSE transport)`);
+    });
+  } else {
+    // Default: stdio transport
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("ERPNext MCP server running on stdio");
+  }
 }
 
 main().catch((error) => {

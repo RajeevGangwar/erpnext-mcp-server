@@ -18,9 +18,13 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "0.6.0",
-    "axios": "^1.8.4"
+    "axios": "^1.8.4",
+    "cors": "^2.8.6",
+    "express": "^5.2.1"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
     "@types/node": "^20.11.24",
     "typescript": "^5.3.3"
   }

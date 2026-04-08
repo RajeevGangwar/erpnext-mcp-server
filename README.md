@@ -1,30 +1,39 @@
 # ERPNext MCP Server
 
-A Model Context Protocol server for ERPNext integration
+A Model Context Protocol server for ERPNext integration.
 
-This is a TypeScript-based MCP server that provides integration with ERPNext/Frappe API. It enables AI assistants to interact with ERPNext data and functionality through the Model Context Protocol.
+This is a TypeScript-based MCP server that provides integration with ERPNext/Frappe API. It enables AI assistants to interact with ERPNext data and functionality through the Model Context Protocol. Supports both **stdio** and **HTTP/SSE** transports.
 
 ## Features
 
 ### Resources
 - Access ERPNext documents via `erpnext://{doctype}/{name}` URIs
+- List all DocTypes via `erpnext://DocTypes`
 - JSON format for structured data access
 
 ### Tools
-- `authenticate_erpnext` - Authenticate with ERPNext using username and password
+- `get_doctypes` - Get a list of all available DocTypes
+- `get_doctype_fields` - Get fields list for a specific DocType
 - `get_documents` - Get a list of documents for a specific doctype
 - `create_document` - Create a new document in ERPNext
 - `update_document` - Update an existing document in ERPNext
 - `run_report` - Run an ERPNext report
-- `get_doctype_fields` - Get fields list for a specific DocType
-- `get_doctypes` - Get a list of all available DocTypes
+- `call_method` - Call a whitelisted Frappe/ERPNext server method
 
-## Configuration
+### Transports
+- **stdio** (default) - For local use with Claude Desktop and other MCP clients
+- **HTTP/SSE** - For remote deployment, microservice-to-microservice communication
 
-The server requires the following environment variables:
-- `ERPNEXT_URL` - The base URL of your ERPNext instance
-- `ERPNEXT_API_KEY` (optional) - API key for authentication
-- `ERPNEXT_API_SECRET` (optional) - API secret for authentication
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `ERPNEXT_URL` | Yes | Base URL of your ERPNext instance |
+| `ERPNEXT_API_KEY` | Yes | ERPNext API key for authentication |
+| `ERPNEXT_API_SECRET` | Yes | ERPNext API secret for authentication |
+| `TRANSPORT` | No | `stdio` (default) or `sse` |
+| `PORT` | No | HTTP port for SSE transport (default: `8000`) |
+| `MCP_SERVER_API_KEY` | No | API key to protect the HTTP endpoint |
 
 ## Development
 
@@ -43,9 +52,11 @@ For development with auto-rebuild:
 npm run watch
 ```
 
-## Installation
+## Usage
 
-To use with Claude Desktop, add the server config:
+### Stdio Transport (Claude Desktop)
+
+Add the server config:
 
 On MacOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
 On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
@@ -57,7 +68,7 @@ On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
       "command": "node",
       "args": ["/path/to/erpnext-server/build/index.js"],
       "env": {
-        "ERPNEXT_URL": "http://your-erpnext-instance.com",
+        "ERPNEXT_URL": "https://your-site.frappe.cloud",
         "ERPNEXT_API_KEY": "your-api-key",
         "ERPNEXT_API_SECRET": "your-api-secret"
       }
@@ -66,14 +77,39 @@ On Windows: `%APPDATA%/Claude/claude_desktop_config.json`
 }
 ```
 
-To use with Claude in VSCode, add the server config to:
+### HTTP/SSE Transport
 
-On MacOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-On Windows: `%APPDATA%/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
+Start the server in SSE mode:
+```bash
+TRANSPORT=sse PORT=8000 ERPNEXT_URL=https://your-site.frappe.cloud \
+  ERPNEXT_API_KEY=your-key ERPNEXT_API_SECRET=your-secret \
+  node build/index.js
+```
+
+Endpoints:
+- `GET /health` - Health check
+- `GET /sse` - SSE connection endpoint (MCP clients connect here)
+- `POST /messages` - Message endpoint (used by SSE transport internally)
+
+To secure the HTTP endpoint, set `MCP_SERVER_API_KEY` and pass `x-api-key` header in requests.
+
+### Docker Deployment
+
+Build and run:
+```bash
+npm run build
+docker build -t erpnext-mcp-server .
+docker run -p 8000:8000 \
+  -e ERPNEXT_URL=https://your-site.frappe.cloud \
+  -e ERPNEXT_API_KEY=your-key \
+  -e ERPNEXT_API_SECRET=your-secret \
+  -e MCP_SERVER_API_KEY=your-mcp-auth-key \
+  erpnext-mcp-server
+```
 
 ### Debugging
 
-Since MCP servers communicate over stdio, debugging can be challenging. We recommend using the [MCP Inspector](https://github.com/modelcontextprotocol/inspector), which is available as a package script:
+We recommend using the [MCP Inspector](https://github.com/modelcontextprotocol/inspector), which is available as a package script:
 
 ```bash
 npm run inspector
@@ -82,20 +118,6 @@ npm run inspector
 The Inspector will provide a URL to access debugging tools in your browser.
 
 ## Usage Examples
-
-### Authentication
-```
-<use_mcp_tool>
-<server_name>erpnext</server_name>
-<tool_name>authenticate_erpnext</tool_name>
-<arguments>
-{
-  "username": "your-username",
-  "password": "your-password"
-}
-</arguments>
-</use_mcp_tool>
-```
 
 ### Get Customer List
 ```
@@ -148,3 +170,22 @@ The Inspector will provide a URL to access debugging tools in your browser.
 }
 </arguments>
 </use_mcp_tool>
+```
+
+### Call a Frappe Whitelisted Method
+```
+<use_mcp_tool>
+<server_name>erpnext</server_name>
+<tool_name>call_method</tool_name>
+<arguments>
+{
+  "method": "erpnext.manufacturing.doctype.bom.bom.get_bom_items",
+  "args": {
+    "bom": "BOM-ITEM001-001",
+    "company": "My Company",
+    "qty": 1
+  }
+}
+</arguments>
+</use_mcp_tool>
+```
