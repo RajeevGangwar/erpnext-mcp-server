@@ -1,10 +1,8 @@
 FROM node:20-slim AS builder
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci
-COPY tsconfig.json ./
+COPY package*.json tsconfig.json ./
 COPY src/ ./src/
-RUN npm run build
+RUN npm ci --ignore-scripts && npm run build
 
 FROM node:20-slim
 WORKDIR /app
